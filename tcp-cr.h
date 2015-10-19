@@ -22,6 +22,7 @@
 #define TCP_CR_H
 
 #include "tcp-socket-base.h"
+#include "ns3/output-stream-wrapper.h"
 
 namespace ns3 {
 
@@ -58,6 +59,17 @@ protected:
   virtual void DupAck (const TcpHeader& t, uint32_t count);  // Halving cwnd and reset nextTxSequence
   virtual void Retransmit (void); // Exit fast recovery upon retransmit timeout
   virtual void ReceivedAck (Ptr<Packet> packet, const TcpHeader& tcpHeader); // Process received ACK
+  //virtual void EstimateBW (int acked, const TcpHeader& tcpHeader, Time rtt); // Process received ACK
+  double GetAverage (const std::list<double>);
+  double GetVarience (const std::list<double>);
+  void EstimateTp (void);
+  int EstimateFlowNumber (double ratio);
+  void FilteringTP (void);
+  //void FilteringBW (void);
+  void FilteringRTT (void);
+  void FilteringVarience (void);
+  int CountAck (const TcpHeader& tcpHeader);
+  void UpdateAckedSegments (int acked);
 
 protected:
   SequenceNumber32       m_recover;      //!< Previous highest Tx seqnum for fast recovery
@@ -65,16 +77,64 @@ protected:
   bool                   m_inFastRec;    //!< currently in fast recovery
   bool                   m_limitedTx;    //!< perform limited transmit
 
-  // For estimate bandwidth quickly
-  double                 m_ackSeqStartNum;
-  double                 m_ackSeqEndNum;
+  // For estimate bandwidth
+  uint32_t               m_ackSeqStartNum;
+  uint32_t               m_ackSeqEndNum;
   double                 m_ackSeqStartTime;
   double                 m_ackSeqEndTime;
-  double                 m_ackSeqCount;
-  double                 m_ackSeqLength;
-  Time                   m_minRtt;
+  uint32_t               m_ackSeqCount;
+  uint32_t               m_ackSeqLength;
+  double                 m_ebw;
+  TracedValue<double>    m_currentTp;              //!< Current value of the estimated throughput
+  double                 m_lastTp;                 //!< Last bandwidth sample after being filtered
 
-  uint32_t               test;
+  // For RTT estimation
+  Time                   m_minRtt;
+  double                 m_rtt_sum;
+  double                 m_rtt_avg;
+  double                 m_rtt_avg_last;
+  double                 m_currentRTT;   // in seconds
+  double                 m_lastSampleRTT;
+  double                 m_lastRttAvg;    // last moving average of RTT
+  std::list<double>      m_rtt_samples;
+
+  // For fast state transition
+  uint32_t               m_nFlows;
+  uint32_t               m_fast_probing;
+  bool                   m_fast_reduce;
+  bool                   m_fast_increase;
+  Time                   m_lastReduce;
+  Time                   m_lastIncrease;
+  uint32_t               m_currentState;
+  uint32_t               m_lastState;
+
+  // Judging whether stable or not
+  double                 m_sigma;
+  double                 m_var;
+  double                 m_currentVar;
+  double                 m_lastVar;
+  double                 m_lastSampleVar;
+
+
+  // Added by westwood
+  int                    m_accountedFor;           //!< The number of received DUPACKs
+
+  double                 m_lastSampleBW;           //!< Last bandwidth sample
+  double                 m_lastAck;                //!< The time last ACK was received
+  SequenceNumber32       m_prevAckNo;              //!< Previously received ACK number
+  bool                   m_IsCount;                //!< Start keeping track of m_ackedSegments for Westwood+ if TRUE
+  EventId                m_bwEstimateEvent;        //!< The BW estimation event for Westwood+
+  int                    m_ackedSegments;          //!< The number of segments ACKed between RTTs
+
+
+
+
+  // For debugging
+  uint32_t                    m_src_port;
+  uint32_t                    m_dst_port;
+  Ptr<OutputStreamWrapper>    stream_tp;
+  Ptr<OutputStreamWrapper>    stream_rtt;
+  Ptr<OutputStreamWrapper>    stream_var;
 };
 
 } // namespace ns3
