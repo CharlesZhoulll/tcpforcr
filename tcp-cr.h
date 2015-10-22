@@ -63,11 +63,13 @@ protected:
   double GetAverage (const std::list<double>);
   double GetVarience (const std::list<double>);
   void EstimateTp (void);
+  void GetTimeVarience (void);
   int EstimateFlowNumber (double ratio);
-  void FilteringTP (void);
+  //void FilteringTP (void);
   //void FilteringBW (void);
+  void Reset (void);
   void FilteringRTT (void);
-  void FilteringVarience (void);
+  //void FilteringVarience (void);
   int CountAck (const TcpHeader& tcpHeader);
   void UpdateAckedSegments (int acked);
 
@@ -86,13 +88,14 @@ protected:
   uint32_t               m_ackSeqLength;
   double                 m_ebw;
   TracedValue<double>    m_currentTp;              //!< Current value of the estimated throughput
-  double                 m_lastTp;                 //!< Last bandwidth sample after being filtered
+  //double                 m_lastTp;                 //!< Last bandwidth sample after being filtered
 
   // For RTT estimation
   Time                   m_minRtt;
-  double                 m_rtt_sum;
-  double                 m_rtt_avg;
-  double                 m_rtt_avg_last;
+  bool                   m_minRttTrust;
+  //double                 m_rtt_sum;
+  //double                 m_rtt_avg;
+  //double                 m_rtt_avg_last;
   double                 m_currentRTT;   // in seconds
   double                 m_lastSampleRTT;
   double                 m_lastRttAvg;    // last moving average of RTT
@@ -105,15 +108,22 @@ protected:
   bool                   m_fast_increase;
   Time                   m_lastReduce;
   Time                   m_lastIncrease;
-  uint32_t               m_currentState;
-  uint32_t               m_lastState;
+  Time                   m_lastSlowStart;
+  //uint32_t               m_currentState;
+  //uint32_t               m_lastState;
+  //int                    m_starveCount;
+
+  bool                   m_fastConverge;
+  uint32_t               m_power;
+
 
   // Judging whether stable or not
   double                 m_sigma;
   double                 m_var;
-  double                 m_currentVar;
-  double                 m_lastVar;
-  double                 m_lastSampleVar;
+  //double                 m_last_var;
+  //double                 m_currentVar;
+  //double                 m_lastVar;
+  //double                 m_lastSampleVar;
 
 
   // Added by westwood
@@ -135,6 +145,7 @@ protected:
   Ptr<OutputStreamWrapper>    stream_tp;
   Ptr<OutputStreamWrapper>    stream_rtt;
   Ptr<OutputStreamWrapper>    stream_var;
+  Ptr<OutputStreamWrapper>    stream_other;
 };
 
 } // namespace ns3

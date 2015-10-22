@@ -37,9 +37,10 @@ NS_LOG_COMPONENT_DEFINE("TcpCR");
 
 NS_OBJECT_ENSURE_REGISTERED(TcpCR);
 
-const int              CONGESTION = 1;
-const int              GOOD = 2;
-const int              STARVE = 3;
+const int UNSTABLE = 0;
+const int CONGESTION = 1;
+const int GOOD = 2;
+const int STARVE = 3;
 
 TypeId TcpCR::GetTypeId(void)
 {
@@ -61,18 +62,25 @@ TcpCR::TcpCR(void) :
         m_ackSeqEndNum(0),
         m_ackSeqStartTime(0.0),
         m_ackSeqEndTime(0.0),
-        m_ackSeqCount( 0),
+        m_ackSeqCount(0),
         m_ackSeqLength(1),
         m_ebw(0),
         m_currentTp(0),
-        m_lastTp(0),
+        //m_lastTp(0),
         m_minRtt(0.0),
+        m_minRttTrust(false),
+        m_currentRTT(0.0),
         m_nFlows(1),
         m_fast_probing(0),
-        m_currentState(STARVE),
+        //m_currentState(UNSTABLE),
+        //m_starveCount(-1),
+        m_lastSlowStart(Time(0)),
+        m_fastConverge(false),
+        m_power(0),
         m_sigma(1e-6),
         m_var(0),
-        m_lastVar(0),
+        //m_last_var(-1e-6),
+        //m_lastVar(0),
         m_src_port(0),
         m_dst_port(0)
 {
@@ -108,6 +116,13 @@ int TcpCR::EstimateFlowNumber(double ratio)
         return 4;
 }
 
+//std::cout<< Simulator::Now().GetSeconds() << " "<< m_dst_port << " m_ssThresh: " << m_ssThresh
+
+/*        if (m_dst_port == 4 && (Simulator::Now().GetSeconds() > 210) && (Simulator::Now().GetSeconds() < 230))
+ {
+ std::cout<< Simulator::Now().GetSeconds() << " CongAvoid "<< m_dst_port << " ssthresh: " << m_ssThresh/1000 << " cwnd: " << m_cWnd/1000 << std::endl;
+ }*/
+
 /* New ACK (up to seqnum seq) received. Increase cwnd and call TcpSocketBase::NewAck() */
 void TcpCR::NewAck(const SequenceNumber32& seq)
 {
@@ -134,15 +149,17 @@ void TcpCR::NewAck(const SequenceNumber32& seq)
 
     // Increase of cwnd based on current phase (slow start or congestion avoidance)
     if (m_cWnd < m_ssThresh)
-    { // Slow start mode, add one segSize to cWnd. Default m_ssThresh is 65535. (RFC2001, sec.1)
+    {
         if (m_fast_probing == 0)
         {
-            //std::cout<<"m_ackSeqStartNum: "<<m_ackSeqStartNum<<" m_ackSeqLength: " << m_ackSeqLength<<std::endl;
+            // Check whether do we enter into fast probing mode
+            // In fast probing mode, the goal is to quickly decide the bandwidth and reset the ssthresh according to flow number
             m_ackSeqCount += 1;
             if ((m_ackSeqStartNum == 0) & (m_cWnd.Get() / m_segmentSize > 1))
             {
                 m_ackSeqStartTime = Simulator::Now().GetSeconds();
                 m_ackSeqStartNum = m_ackSeqCount;
+                // Cannot arbitrarily set m_ackSeqLength to be 1, because the initial cwnd might be other value
                 m_ackSeqLength = m_cWnd.Get() / m_segmentSize;
             }
             else if (m_ackSeqCount == m_ackSeqStartNum + m_ackSeqLength - 1)
@@ -154,10 +171,45 @@ void TcpCR::NewAck(const SequenceNumber32& seq)
                 m_ebw = fEBW;
                 // Calculate BDP using minimum RTT * EBW
                 double BDP = m_minRtt.GetSeconds() * fEBW;  // in Byte
-                m_ssThresh = BDP;   // in byte
-
+                // Here we need the information senet by the receiver
+                if ( Simulator::Now().GetSeconds() < 25 )
+                {
+                    m_nFlows = 1;
+                }
+                else if ( Simulator::Now().GetSeconds() < 45)
+                {
+                    m_nFlows = 2;
+                }
+               else if ( Simulator::Now().GetSeconds() < 65)
+                {
+                    m_nFlows = 3;
+                }
+               else if ( Simulator::Now().GetSeconds() < 125)
+               {
+                    m_nFlows = 4;
+                }
+               else if ( Simulator::Now().GetSeconds() < 145)
+                {
+                    m_nFlows = 3;
+                }
+               else if ( Simulator::Now().GetSeconds() < 165)
+                {
+                    m_nFlows = 2;
+                }
+                else
+                {
+                    m_nFlows = 1;
+                }
+                if (m_minRttTrust == false)
+                {
+                    if (m_nFlows == 1)
+                        m_minRttTrust = true;
+                }
+                //m_nFlows = 4;
+                // Quickly set the ssthresh, get out of fast probing mode
+                m_ssThresh = BDP / m_nFlows;   // in byte
                 m_fast_probing = 1;
-                // Get one throughput sample, update status
+                // Need to use the following parameters..so do not touch them
                 m_ackSeqCount = 0;
                 m_ackSeqStartNum = 0;
                 m_ackSeqEndNum = 0;
@@ -166,204 +218,183 @@ void TcpCR::NewAck(const SequenceNumber32& seq)
             }
         }
         m_cWnd += m_segmentSize;
-        if (m_dst_port == 4 && (Simulator::Now().GetSeconds() > 210) && (Simulator::Now().GetSeconds() < 230))
-                {
-                    std::cout<< Simulator::Now().GetSeconds() << "SlowStart "<< m_dst_port << " ssthresh: " << m_ssThresh/1000 << " cwnd: " << m_cWnd/1000 << std::endl;
-                }
         NS_LOG_INFO(
                 "In SlowStart, ACK of seq " << seq << "; update cwnd to " << m_cWnd << "; ssthresh " << m_ssThresh);
     }
     else
     {
+        if (m_lastSlowStart == 0)
+        {
+            m_lastSlowStart = Simulator::Now();
+        }
         // Congestion avoidance mode, increase by (segSize*segSize)/cwnd. (RFC2581, sec.3.1)
         // To increase cwnd for one segSize per RTT, it should be (ackBytes*segSize)/cwnd
         double adder = static_cast<double>(m_segmentSize * m_segmentSize) / m_cWnd.Get();
         adder = std::max(1.0, adder);
-        if (m_var < m_sigma)
+        // m_var is the varience of RTT, only update cwnd when the RTT is stable
+        if ((m_var < m_sigma) && (m_var > 0))
         {
             // Stable stage
-            //*stream_var->GetStream() << Simulator::Now().GetSeconds() << " " << 1
-            //                           << std::endl;
+           if ((m_currentRTT < 1.05 *  m_minRtt.GetSeconds()))
+           {
+               //std::cout << Simulator::Now().GetSeconds() << " "<< m_dst_port <<": Starving state: m_currentRTT: " <<  m_currentRTT << " m_minRtt " << m_minRtt.GetSeconds() << std::endl;
+               double sinceLastSlowStart = Simulator::Now().GetSeconds()
+                                                               - m_lastSlowStart.GetSeconds();
+               if (sinceLastSlowStart > 2)
+                {
+                    // Probably underutilize the bandwidth
+                    if (m_fastConverge == false)
+                    {
+                        // If we just get into situation where RTT falls behind ssthresh
+                        m_fastConverge = true;
+                        // The speed to converge is propotion to its estimation of flow number
+                        // This guarantee the flow with lower throughput will increase faster
+                        m_power = m_nFlows;
+                        m_lastIncrease = Simulator::Now();
+                    }
+                    else
+                    {
+                        double timeDifference = Simulator::Now().GetSeconds()
+                                - m_lastIncrease.GetSeconds();
+                        // If after 0.5s we still got starving, double the increase rate
+                        if (timeDifference > 1)
+                        {
+                            m_power *= 2;
+                            m_lastIncrease = Simulator::Now();
+                        }
+                    }
+                    m_cWnd += static_cast<uint32_t>(m_power * adder);
+                    //std::cout<< Simulator::Now().GetSeconds() << " "<< m_dst_port <<  " Starv " << " m_cWnd: " << m_cWnd/1000 << " ssthresh: " << m_ssThresh/1000 << std::endl;
+                }
+            }
+            else if (m_currentRTT  > 1.1 * m_minRtt.GetSeconds())
+            {
+                //std::cout << Simulator::Now().GetSeconds() << " "<< m_dst_port <<": Cong state: m_currentRTT: " <<  m_currentRTT << " m_minRtt " << m_minRtt.GetSeconds() << std::endl;
 
-            m_lastState = m_currentState;
-            if ((m_currentRTT < 1.2 * m_minRtt.GetSeconds())
-                    & (m_currentRTT > 1.05 * m_minRtt.GetSeconds()))
-            {
-                // In good state
-                m_currentState = GOOD;
-            }
-            else if (m_currentRTT < 1.05 * m_minRtt.GetSeconds())
-            {
-                // in starve state
-                m_currentState = STARVE;
-                if (true)
-                {
-                    m_cWnd += static_cast<uint32_t>(adder);
-                }
-                else
-                {
-                }
-            }
-            else if (m_currentRTT > 1.2 * m_minRtt.GetSeconds())
-            {
-                m_currentState = CONGESTION;
-                // in possible congsetion state
-                //std::cout<< Simulator::Now().GetSeconds() << " m_currentTp: " << m_currentTp.Get()/125000 << " m_ebw: " << m_ebw/125000<<std::endl;
+                // In congsetion state, two possibilities:
+                // (1) The estimate flow number is not right, reset ssthresh
+                // (2) The estimate flow number is fine, but send a little bit too aggressive, reduce cwnd gracefully
+                m_fastConverge = false;
+/*                double sinceLastSlowStart = Simulator::Now().GetSeconds()
+                                                - m_lastSlowStart.GetSeconds();*/
                 if (m_currentTp != 0)
                 {
-                    //std::cout<< Simulator::Now().GetSeconds() << " m_currentTp: " << m_currentTp.Get()/125000 << " m_ebw: " << m_ebw/125000<<std::endl;
+                    // We need estimation of throughput to estimate fair share and flow number
                     double fixRatio = m_currentTp.Get() / (double) m_ebw;
                     uint32_t estimateFlows = EstimateFlowNumber(fixRatio);
-                    if ((Simulator::Now().GetSeconds() > 21)
-                            && (Simulator::Now().GetSeconds() < 22))
+                    double BDP = (double) m_ebw * m_minRtt.GetSeconds();
+                    if (estimateFlows != m_nFlows)
                     {
-                        std::cout<< Simulator::Now().GetSeconds() << " "<< m_dst_port << " fixRatio: " << fixRatio << " Estimate number of flows: " << m_nFlows<<std::endl;
-                    }
-                    if (estimateFlows > m_nFlows)
-                    {
-                        int lastNFlow = m_nFlows;
-                        m_nFlows = estimateFlows;
-                        //std::cout<< Simulator::Now().GetSeconds() << " "<< m_dst_port << " fixRatio: " << fixRatio << " Estimate number of flows: " << m_nFlows<<std::endl;
-                        double timeDifference = Simulator::Now().GetSeconds()
+                        // The estimation of flow number is either too aggressive or too conservative
+                        double sinceLastReduce = Simulator::Now().GetSeconds()
                                 - m_lastReduce.GetSeconds();
-                        if (m_lastReduce == 0 || timeDifference > m_currentRTT)
+                        // If it has been over 0.5s since last fast reduce
+                        if (m_lastReduce == 0 || sinceLastReduce > 1)
                         {
-                            m_ssThresh = m_ssThresh * lastNFlow/ (double) m_nFlows;
+                            m_nFlows = estimateFlows;
+                            m_ssThresh = BDP / m_nFlows;
                             m_cWnd = m_ssThresh;
                             m_lastReduce = Simulator::Now();
                         }
                     }
-                    //std::cout<< Simulator::Now().GetSeconds() << " fixRatio: " << fixRatio << " Estimate number of flows: " << m_nFlows<<std::endl;
                     else if (estimateFlows == m_nFlows)
                     {
-                        m_cWnd -= static_cast<uint32_t>(adder);
-                        m_cWnd = std::max(m_segmentSize, m_cWnd.Get());
-                        m_ssThresh = m_cWnd;
+
                     }
-                    else
+                }
+                //std::cout<< Simulator::Now().GetSeconds() << " "<< m_dst_port <<  " Cong " << " m_cWnd: " << m_cWnd/1000 << " ssthresh: " << m_ssThresh/1000 << std::endl;
+            }
+            else
+            {
+                //std::cout << Simulator::Now().GetSeconds() << " "<< m_dst_port <<": Good state: m_currentRTT: " <<  m_currentRTT << " m_minRtt " << m_minRtt.GetSeconds() << std::endl;
+
+                // In good state. Reallocate fair share
+                if (m_currentTp != 0)
+                {
+                    double fixRatio = m_currentTp.Get() / (double) m_ebw;
+                    uint32_t estimateFlows = EstimateFlowNumber(fixRatio);
+                    if (estimateFlows < m_nFlows)
                     {
-                        //std::cout<< Simulator::Now().GetSeconds() << " estimateFlows: " << estimateFlows << " m_nFlows: " << m_nFlows<<std::endl;
+                        m_nFlows = estimateFlows;
+                        double BDP = (double) m_ebw * m_minRtt.GetSeconds();
+                        m_ssThresh = BDP / m_nFlows;
+                        m_cWnd = std::max(m_cWnd, m_ssThresh);
                     }
                 }
             }
         }
-        // Save rtt samples
-        m_rtt_samples.push_back(m_currentRTT);
-        // Make sure only collect RTT samples in one RTT
-        if (m_rtt_samples.size() > 200)
+        else
         {
-            m_rtt_samples.pop_front();
+            m_fastConverge = false;
         }
-        //std::cout<<m_rtt_samples.size()<<std::endl;
-/*        if ((Simulator::Now().GetSeconds() > 13) && (Simulator::Now().GetSeconds() < 14))
-        {
-            std::list<double>::const_iterator it;
-            double sum = 0;
-            for (it = m_rtt_samples.begin(); it != m_rtt_samples.end(); ++it)
-            {
-                sum += *it;
-                *stream_var->GetStream() << Simulator::Now().GetSeconds() << " " << *it
-                                   << std::endl;
-            }
-            *stream_var->GetStream() <<  "****************" << std::endl;
-        }*/
-        m_var = GetVarience(m_rtt_samples);
-        m_currentVar = m_var;
-
-
-        //FilteringVarience();
-        *stream_var->GetStream() << Simulator::Now().GetSeconds() << " " << m_var
-                            << std::endl;
-        //std::cout << Simulator::Now().GetSeconds() << " " << m_currentVar << std::endl;
-        // Estimate current throughput
-        //m_rtt_sum += m_lastRtt.Get().ToDouble(Time::S);
-        m_ackSeqCount += 1;
-        if (m_ackSeqStartTime == 0)
-            m_ackSeqStartTime = Simulator::Now().GetSeconds();
-        double timeDifference = Simulator::Now().GetSeconds() - m_ackSeqStartTime;
-        if (timeDifference >= 0.5)
-        {
-            // get a new m_currentTp samples
-            m_currentTp = m_ackSeqCount * m_segmentSize / timeDifference; // in bps
-/*            if ((Simulator::Now().GetSeconds() > 15) && (Simulator::Now().GetSeconds() < 16))
-            {
-                std::cout << Simulator::Now().GetSeconds() << " " << m_dst_port << " m_currentTp: "
-                        << m_currentTp << " m_ackSeqCount: " << m_ackSeqCount << " timeDifference: " << timeDifference
-                        << std::endl;
-            }*/
-            m_ackSeqStartTime = Simulator::Now().GetSeconds();
-            m_ackSeqCount = 0;
-        }
-        *stream_tp->GetStream() << Simulator::Now().GetSeconds() << " " << m_currentTp / 125000
-                << std::endl;
-        m_rtt_avg_last = m_rtt_avg;
-        m_rtt_sum = 0;
-
-/*        if (m_ackSeqCount == 1)
-        {
-            m_ackSeqLength = BytesInFlight() / m_segmentSize;
-            m_ackSeqStartTime = Simulator::Now().GetSeconds();
-        }
-        else if (m_ackSeqCount == m_ackSeqLength)
-        {
-            // almost finish an RTT
-            m_ackSeqEndTime = Simulator::Now().GetSeconds();
-            double last = m_ackSeqEndTime - m_ackSeqStartTime;
-            //m_rtt_avg = m_rtt_sum / m_ackSeqCount;
-            //std::cout << Simulator::Now().GetSeconds() << " " << last << std::endl;
-            m_currentTp = m_ackSeqLength * m_segmentSize / last; // in bps
-            if ((Simulator::Now().GetSeconds() > 15) && (Simulator::Now().GetSeconds() < 16))
-            {
-                std::cout<< Simulator::Now().GetSeconds() << " "<< m_dst_port << " m_currentTp: " << m_currentTp << " m_ackSeqLength: "
-                        << m_ackSeqLength<< " last: " << last <<  std::endl;
-            }
-            // fix the problem in bw estimating
-            if (m_lastTp == 0)
-            {
-                m_lastTp = m_currentTp;
-            }
-            //FilteringBW();
-            //std::cout << Simulator::Now().GetSeconds() << " " << m_currentTp/125000 << std::endl;
-        }*/
+        EstimateTp();
+        GetTimeVarience();
         NS_LOG_INFO("In CongAvoid, updated to cwnd " << m_cWnd/1000 << " ssthresh " << m_ssThresh);
-
-/*        if (m_dst_port == 4 && (Simulator::Now().GetSeconds() > 210) && (Simulator::Now().GetSeconds() < 230))
-        {
-            std::cout<< Simulator::Now().GetSeconds() << " CongAvoid "<< m_dst_port << " ssthresh: " << m_ssThresh/1000 << " cwnd: " << m_cWnd/1000 << std::endl;
-        }*/
     }
     // Complete newAck processing
     TcpSocketBase::NewAck(seq);
+    *stream_var->GetStream() << Simulator::Now().GetSeconds() << " " << m_var << std::endl;
+}
+
+void TcpCR::GetTimeVarience()
+{
+    NS_LOG_FUNCTION(this);
+    // Save rtt samples, compute varience of RTT
+    m_rtt_samples.push_back(m_currentRTT);
+    // Window to collect rtt samples: 200
+    if (m_rtt_samples.size() > 200)
+    {
+        m_rtt_samples.pop_front();
+    }
+    m_var = GetVarience(m_rtt_samples);
+}
+
+void TcpCR::EstimateTp()
+{
+    NS_LOG_FUNCTION(this);
+    // Estimate throughput every 0.5 seconds
+    m_ackSeqCount += 1;
+    if (m_ackSeqStartTime == 0)
+        m_ackSeqStartTime = Simulator::Now().GetSeconds();
+    double timeDifference = Simulator::Now().GetSeconds() - m_ackSeqStartTime;
+    if (timeDifference >= 1)
+    {
+        // get a new m_currentTp samples
+        m_currentTp = m_ackSeqCount * m_segmentSize / timeDifference; // in bps
+        m_ackSeqStartTime = Simulator::Now().GetSeconds();
+        m_ackSeqCount = 0;
+    }
+    *stream_tp->GetStream() << Simulator::Now().GetSeconds() << " " << m_currentTp / 125000
+            << std::endl;
 }
 
 double TcpCR::GetAverage(const std::list<double> linkedlist)
 {
     std::list<double>::const_iterator it;
     double sum = 0;
-    for (it = linkedlist.begin(); it!=linkedlist.end(); ++it)
+    for (it = linkedlist.begin(); it != linkedlist.end(); ++it)
     {
         sum += *it;
     }
-    return sum/linkedlist.size();
+    return sum / linkedlist.size();
 }
-
 
 double TcpCR::GetVarience(const std::list<double> linkedlist)
 {
     std::list<double>::const_iterator it;
     double sum = 0;
     double avg = 0;
-    for (it = linkedlist.begin(); it!=linkedlist.end(); ++it)
+    for (it = linkedlist.begin(); it != linkedlist.end(); ++it)
     {
         sum += *it;
     }
-    avg = sum/linkedlist.size();
+    avg = sum / linkedlist.size();
     double sumsquare = 0;
-    for (it = linkedlist.begin(); it!=linkedlist.end(); ++it)
+    for (it = linkedlist.begin(); it != linkedlist.end(); ++it)
     {
-        sumsquare += (*it - avg)*(*it - avg);
+        sumsquare += (*it - avg) * (*it - avg);
     }
-    return sumsquare/linkedlist.size();
+    return sumsquare / linkedlist.size();
 }
 
 int TcpCR::CountAck(const TcpHeader& tcpHeader)
@@ -438,7 +469,13 @@ void TcpCR::ReceivedAck(Ptr<Packet> packet, const TcpHeader& tcpHeader)
                 fileNameRoot + NumberToString(m_src_port) + "-" + NumberToString(m_dst_port)
                         + ".var");
     }
-    int acked = 0;
+    if (!stream_other)
+    {
+        AsciiTraceHelper ascii;
+        stream_other = ascii.CreateFileStream(
+                fileNameRoot + NumberToString(m_src_port) + "-" + NumberToString(m_dst_port)
+                        + ".other");
+    }
     if ((0 != (tcpHeader.GetFlags() & TcpHeader::ACK)))
     {
         // Only do it for ACK
@@ -462,43 +499,23 @@ void TcpCR::ReceivedAck(Ptr<Packet> packet, const TcpHeader& tcpHeader)
                 << std::endl;
 
     }
-    if ((0 != (tcpHeader.GetFlags() & TcpHeader::ACK)) && tcpHeader.GetAckNumber() >= m_prevAckNo)
-    {
-        acked = CountAck(tcpHeader);
-        m_ackedSegments += acked;
-        //EstimateBW (acked, tcpHeader, Time(0));
-    }
     // Complete ack processing
     TcpSocketBase::ReceivedAck(packet, tcpHeader);
 }
 
-/*void TcpCR::EstimateBW(int acked, const TcpHeader& tcpHeader, Time rtt)
-{
-    NS_LOG_FUNCTION(this);
-    // Get the time when the current ACK is received
-    double currentAck = static_cast<double>(Simulator::Now().GetSeconds());
-    // Calculate the BW
-    m_currentTp = acked * m_segmentSize / (currentAck - m_lastAck);
-    // Update the last ACK time
-    m_lastAck = currentAck;
-    // Filter the BW sample
-    FilteringBW();
-    //std::cout<<Simulator::Now().GetSeconds() << " " <<m_currentTp * 8 / 1000000<<std::endl;
-}*/
 
-void TcpCR::FilteringVarience()
+/*void TcpCR::FilteringVarience()
 {
     NS_LOG_FUNCTION(this);
 
     double alpha = 0.9;
     double sample_varience = m_currentVar;
-    m_currentVar = (alpha * m_lastVar) + ((1 - alpha) * ((sample_varience + m_lastSampleVar)/2));
+    m_currentVar = (alpha * m_lastVar) + ((1 - alpha) * ((sample_varience + m_lastSampleVar) / 2));
     m_lastSampleVar = sample_varience;
     m_lastVar = m_currentVar;
-}
+}*/
 
-
-void TcpCR::FilteringTP()
+/*void TcpCR::FilteringTP()
 {
     NS_LOG_FUNCTION(this);
 
@@ -507,7 +524,7 @@ void TcpCR::FilteringTP()
     m_currentTp = (alpha * m_lastTp) + ((1 - alpha) * ((sample_bwe + m_lastSampleBW) / 2));
     m_lastSampleBW = sample_bwe;
     m_lastTp = m_currentTp;
-}
+}*/
 
 void TcpCR::FilteringRTT()
 {
@@ -515,10 +532,8 @@ void TcpCR::FilteringRTT()
     double alpha = 0.8;
     double sample_rtt = m_currentRTT;
     m_currentRTT = (alpha * m_lastRttAvg) + ((1 - alpha) * ((sample_rtt + m_lastSampleRTT) / 2));
-    //std::cout<<Simulator::Now().GetSeconds() << " " <<m_currentRTT<<std::endl;
     m_lastSampleRTT = sample_rtt;
     m_lastRttAvg = m_currentRTT;
-    //std::cout<<Simulator::Now().GetSeconds() << " " <<m_currentRTT.GetSeconds()<<std::endl;
 }
 
 /* Cut cwnd and enter fast recovery mode upon triple dupack */
@@ -554,6 +569,27 @@ void TcpCR::DupAck(const TcpHeader& t, uint32_t count)
     };
 }
 
+void TcpCR::Reset(void)
+{
+    m_ackSeqCount = 0;
+    m_ackSeqLength = 1;
+    m_ackSeqStartNum = 0;
+    m_ackSeqEndNum = 0;
+    m_ackSeqStartTime = 0;
+    m_ackSeqEndTime = 0;
+    m_fast_probing = 0;
+    m_currentTp = 0;
+    m_lastReduce = Time(0);
+    m_lastIncrease = Time(0);
+    m_rtt_samples.clear();
+    m_nFlows = 1;
+    m_var = 0;
+    m_fastConverge = false;
+    m_power = 0;
+    m_lastSlowStart = Time(0);
+    m_minRttTrust = true;
+}
+
 /* Retransmit timeout */
 void TcpCR::Retransmit(void)
 {
@@ -577,26 +613,8 @@ void TcpCR::Retransmit(void)
     m_nextTxSequence = m_txBuffer->HeadSequence(); // Restart from highest Ack
     NS_LOG_INFO(
             "RTO. Reset cwnd to " << m_cWnd << ", ssthresh to " << m_ssThresh << ", restart from seqnum " << m_nextTxSequence);
-
-    if (m_dst_port == 4 && (Simulator::Now().GetSeconds() > 218) && (Simulator::Now().GetSeconds() < 219))
-        {
-            std::cout<< Simulator::Now().GetSeconds() << "RTO "<< m_dst_port << " ssthresh: " << m_ssThresh/1000 << " cwnd: " << m_cWnd/1000 << std::endl;
-        }
-    // Be prefare to estimate bandwidth in slow start
-    m_rtt_sum = 0;
-    m_ackSeqCount = 0;
-    m_ackSeqLength = 1;
-    m_ackSeqStartNum = 0;
-    m_ackSeqEndNum = 0;
-    m_ackSeqStartTime = 0;
-    m_ackSeqEndTime = 0;
-    m_fast_probing = 0;
-    m_currentTp = 0;
-    m_lastTp = 0;
-    m_lastReduce = Time(0);
-    m_lastIncrease = Time(0);
-    m_rtt_samples.clear();
-    m_nFlows = 1;
+    // Be prefared to estimate bandwidth in slow start
+    Reset();
     DoRetransmit();                          // Retransmit the packet
 }
 
