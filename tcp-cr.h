@@ -92,7 +92,7 @@ protected:
 
   // For RTT estimation
   Time                   m_minRtt;
-  bool                   m_minRttTrust;
+  bool                   m_firstSlowStart;
   //double                 m_rtt_sum;
   //double                 m_rtt_avg;
   //double                 m_rtt_avg_last;
@@ -103,7 +103,7 @@ protected:
 
   // For fast state transition
   uint32_t               m_nFlows;
-  uint32_t               m_fast_probing;
+  bool                   m_fast_probing;
   bool                   m_fast_reduce;
   bool                   m_fast_increase;
   Time                   m_lastReduce;
