@@ -24,6 +24,31 @@
 #include "tcp-socket-base.h"
 #include "ns3/output-stream-wrapper.h"
 
+// For statistic calcluation
+/*
+#include  "ap.h"
+#include  "dataanalysis.h"
+#include  "alglibinternal.h"
+#include  "specialfunctions.h"
+#include  "alglibmisc.h"
+#include  "integration.h"
+#include  "linalg.h"
+#include  "optimization.h"
+#include  "solvers.h"
+#include  "statistics.h"
+
+#include  "ap.cpp"
+#include  "dataanalysis.cpp"
+#include  "alglibinternal.cpp"
+#include  "specialfunctions.cpp"
+#include  "alglibmisc.cpp"
+#include  "integration.cpp"
+#include  "linalg.cpp"
+#include  "optimization.cpp"
+#include  "solvers.cpp"
+#include  "statistics.cpp"
+*/
+
 namespace ns3 {
 
 /**
@@ -63,7 +88,7 @@ protected:
   double GetAverage (const std::list<double>);
   double GetVarience (const std::list<double>);
   void EstimateTp (void);
-  void GetTimeVarience (void);
+  double GetSlope (void);
   int EstimateFlowNumber (double ratio);
   //void FilteringTP (void);
   //void FilteringBW (void);
@@ -91,6 +116,7 @@ protected:
   //double                 m_lastTp;                 //!< Last bandwidth sample after being filtered
 
   // For RTT estimation
+  Time                   m_firstMinRtt;
   Time                   m_minRtt;
   bool                   m_firstSlowStart;
   //double                 m_rtt_sum;
@@ -99,7 +125,9 @@ protected:
   double                 m_currentRTT;   // in seconds
   double                 m_lastSampleRTT;
   double                 m_lastRttAvg;    // last moving average of RTT
-  std::list<double>      m_rtt_samples;
+  Time                   m_startCollecting;
+  std::vector<double>      m_rtt_samples;
+  std::vector<double>      m_time_samples;
 
   // For fast state transition
   uint32_t               m_nFlows;
@@ -112,10 +140,11 @@ protected:
   //uint32_t               m_currentState;
   //uint32_t               m_lastState;
   //int                    m_starveCount;
-
   bool                   m_fastConverge;
   uint32_t               m_power;
 
+  uint32_t                   m_stage;
+  uint32_t                   m_comThresh;
 
   // Judging whether stable or not
   double                 m_sigma;
@@ -140,6 +169,7 @@ protected:
 
 
   // For debugging
+  std::string                 folder;
   uint32_t                    m_src_port;
   uint32_t                    m_dst_port;
   Ptr<OutputStreamWrapper>    stream_tp;

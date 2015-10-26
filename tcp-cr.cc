@@ -29,6 +29,32 @@
 #include "ns3/node.h"
 #include "ns3/packet.h"
 #include "ns3/trace-helper.h"
+#include "ns3/string.h"
+
+// For statistic calcluation
+#include  "ns3/ap.h"
+#include  "ns3/dataanalysis.h"
+#include  "ns3/alglibinternal.h"
+#include  "ns3/specialfunctions.h"
+#include  "ns3/alglibmisc.h"
+#include  "ns3/integration.h"
+#include  "ns3/linalg.h"
+#include  "ns3/optimization.h"
+#include  "ns3/solvers.h"
+#include  "ns3/statistics.h"
+
+/*
+#include  "ap.cpp"
+#include  "dataanalysis.cpp"
+#include  "alglibinternal.cpp"
+#include  "specialfunctions.cpp"
+#include  "alglibmisc.cpp"
+#include  "integration.cpp"
+#include  "linalg.cpp"
+#include  "optimization.cpp"
+#include  "solvers.cpp"
+#include  "statistics.cpp"
+*/
 
 namespace ns3
 {
@@ -37,20 +63,29 @@ NS_LOG_COMPONENT_DEFINE("TcpCR");
 
 NS_OBJECT_ENSURE_REGISTERED(TcpCR);
 
-const int UNSTABLE = 0;
-const int CONGESTION = 1;
-const int GOOD = 2;
-const int STARVE = 3;
+const int STABLE = 0;
+const int UNSTABLE = 1;
+const int COMPETEING = 2;
 
 TypeId TcpCR::GetTypeId(void)
 {
     static TypeId tid =
-            TypeId("ns3::TcpCR").SetParent<TcpSocketBase>().SetGroupName("Internet").AddConstructor<
-                    TcpCR>().AddAttribute("ReTxThreshold", "Threshold for fast retransmit",
-                    UintegerValue(3), MakeUintegerAccessor(&TcpCR::m_retxThresh),
-                    MakeUintegerChecker<uint32_t>()).AddAttribute("LimitedTransmit",
-                    "Enable limited transmit", BooleanValue(false),
-                    MakeBooleanAccessor(&TcpCR::m_limitedTx), MakeBooleanChecker());
+            TypeId("ns3::TcpCR").SetParent<TcpSocketBase>()
+            .SetGroupName("Internet")
+            .AddConstructor<TcpCR>()
+            .AddAttribute("ReTxThreshold",
+                    "Threshold for fast retransmit",
+                    UintegerValue(3),
+                    MakeUintegerAccessor(&TcpCR::m_retxThresh),
+                    MakeUintegerChecker<uint32_t>())
+            .AddAttribute("LimitedTransmit","Enable limited transmit",
+                    BooleanValue(false),
+                    MakeBooleanAccessor(&TcpCR::m_limitedTx),
+                    MakeBooleanChecker())
+             .AddAttribute("Folder", "Use this to choose foler to put all results",
+                     StringValue("./results/TcpCR/"),
+                     MakeStringAccessor(&TcpCR::folder),
+                     MakeStringChecker());
     return tid;
 }
 
@@ -67,9 +102,11 @@ TcpCR::TcpCR(void) :
         m_ebw(0),
         m_currentTp(0),
         //m_lastTp(0),
+        m_firstMinRtt(Time(0)),
         m_minRtt(0.0),
         m_firstSlowStart(true),
         m_currentRTT(0.0),
+        m_startCollecting(Time(0)),
         m_nFlows(0),
         m_fast_probing(0),
         //m_currentState(UNSTABLE),
@@ -77,6 +114,8 @@ TcpCR::TcpCR(void) :
         m_lastSlowStart(Time(0)),
         m_fastConverge(false),
         m_power(0),
+        m_stage(STABLE),
+        m_comThresh(0),
         m_sigma(1e-6),
         m_var(0),
         //m_last_var(-1e-6),
@@ -106,14 +145,36 @@ Ptr<TcpSocketBase> TcpCR::Fork(void)
 
 int TcpCR::EstimateFlowNumber(double ratio)
 {
-    if (ratio > 0.75)
-        return 1;
+    int flowNumber;
+    for (int i = 1; i <= 4; i++)
+    {
+        flowNumber = i;
+        double lowerBound =  ((int) (100 * (2*i + 1.0)/(2.0*i*(i+1))))/100.0;
+        double ratioRound = ceil(ratio * 100)/100.0;
+        if (ratioRound >= lowerBound)
+        {
+            break;
+        }
+    }
+/*    if (ratio > 0.75)
+        flowNumber = 1;
     else if (ratio > 0.4)
-        return 2;
+        flowNumber =  2;
     else if (ratio > 0.28)
-        return 3;
+        flowNumber =  3;
+    else if (ratio > 0.22)
+        flowNumber =  4;
+    else if (ratio > 0.18)
+        flowNumber =  5;
+    else if (ratio > 0.15)
+        flowNumber =  6;
+    else if (ratio > 0.13)
+        flowNumber =  7;
     else
-        return 4;
+        flowNumber = 8;*/
+
+
+    return flowNumber;
 }
 
 //std::cout<< Simulator::Now().GetSeconds() << " "<< m_dst_port << " m_ssThresh: " << m_ssThresh
@@ -146,10 +207,11 @@ void TcpCR::NewAck(const SequenceNumber32& seq)
         NS_LOG_INFO(
                 "Received full ACK for seq " << seq <<". Leaving fast recovery with cwnd set to " << m_cWnd);
     }
-
     // Increase of cwnd based on current phase (slow start or congestion avoidance)
     if (m_cWnd < m_ssThresh)
     {
+        double fEBW = 0;
+        double BDP = 0;
         if (m_fast_probing == 0)
         {
             // Check whether do we enter into fast probing mode
@@ -167,14 +229,17 @@ void TcpCR::NewAck(const SequenceNumber32& seq)
                 m_ackSeqEndNum = m_ackSeqCount;
                 m_ackSeqEndTime = Simulator::Now().GetSeconds();
                 double last = m_ackSeqEndTime - m_ackSeqStartTime;
-                double fEBW = ((1054 * (m_ackSeqLength - 1)) / last); // in Bps
+                fEBW = ((1054 * (m_ackSeqLength - 1)) / last); // in Bps
                 m_ebw = fEBW;
                 // Calculate BDP using minimum RTT * EBW
-                double BDP = m_minRtt.GetSeconds() * fEBW;  // in Byte
+                BDP = m_minRtt.GetSeconds() * fEBW;  // in Byte
+                if (m_firstMinRtt == 0)
+                    m_firstMinRtt = m_minRtt;
                 // Here we need the information senet by the receiver
                 if (m_nFlows == 0)
                 {
-                    if (Simulator::Now().GetSeconds() < 25)
+                    m_nFlows = 1;
+/*                    if (Simulator::Now().GetSeconds() < 25)
                     {
                         m_nFlows = 1;
                     }
@@ -186,25 +251,28 @@ void TcpCR::NewAck(const SequenceNumber32& seq)
                     {
                         m_nFlows = 3;
                     }
-                    else
+                    else if (Simulator::Now().GetSeconds() < 125)
                     {
                         m_nFlows = 4;
                     }
+                    else if (Simulator::Now().GetSeconds() < 145)
+                    {
+                        m_nFlows = 3;
+                    }
+                    else if (Simulator::Now().GetSeconds() < 165)
+                    {
+                        m_nFlows = 2;
+                    }
+                    else
+                    {
+                        m_nFlows = 1;
+                    }*/
                 }
                 m_ssThresh = BDP / m_nFlows;   // in byte
-                //std::cout<< Simulator::Now().GetSeconds() << " "<< m_dst_port <<  "  " << " m_nFlows: " << m_nFlows << " ssthresh: " << m_ssThresh/1000 << std::endl;
                 // First slow start, and there are other flows, in this case we do two tunes
                 // First we do not "trust" the rtt setting
                 // Second we slightly increase the initial ssthresh
-/*                if (m_firstSlowStart == false)
-                {
-                    if (m_nFlows == 1)
-                        m_firstSlowStart = true;
-                }*/
-                //m_nFlows = 4;
                 // Quickly set the ssthresh, get out of fast probing mode
-                if (m_nFlows > 1)
-
                 m_fast_probing = 1;
                 // Need to use the following parameters..so do not touch them
                 m_ackSeqCount = 0;
@@ -214,6 +282,7 @@ void TcpCR::NewAck(const SequenceNumber32& seq)
                 m_ackSeqEndTime = 0;
             }
         }
+        // Updating m_ssThresh if min_rtt changed ..
         m_cWnd += m_segmentSize;
         NS_LOG_INFO(
                 "In SlowStart, ACK of seq " << seq << "; update cwnd to " << m_cWnd << "; ssthresh " << m_ssThresh);
@@ -229,14 +298,29 @@ void TcpCR::NewAck(const SequenceNumber32& seq)
         double adder = static_cast<double>(m_segmentSize * m_segmentSize) / m_cWnd.Get();
         adder = std::max(1.0, adder);
         // m_var is the varience of RTT, only update cwnd when the RTT is stable
-        if ((m_var < m_sigma) && (m_var > 0))
+        if (m_stage == STABLE)
         {
-            // Stable stage
-           if ((m_currentRTT < 1.05 *  m_minRtt.GetSeconds()))
-           {
-               //std::cout << Simulator::Now().GetSeconds() << " "<< m_dst_port <<": Starving state: m_currentRTT: " <<  m_currentRTT << " m_minRtt " << m_minRtt.GetSeconds() << std::endl;
-               if (!m_firstSlowStart || m_nFlows == 1)
-               {
+            // Revise ssthresh, incase the min rtt measured is not right ....
+            if (m_firstSlowStart)
+            {
+                if (m_firstMinRtt != m_minRtt)
+                {
+                    double BDP = m_minRtt.GetSeconds() * m_ebw;
+                    m_ssThresh = BDP / m_nFlows;
+                    m_cWnd = m_ssThresh;
+                }
+            }
+            if ((m_currentRTT < 1.05 * m_minRtt.GetSeconds()))
+            {/*
+                if ((Simulator::Now().GetSeconds() > 125) && (Simulator::Now().GetSeconds() < 138))
+                {
+                    std::cout << Simulator::Now().GetSeconds() << " " << m_dst_port
+                            << ": Starve state: m_currentRTT: " << m_currentRTT << " m_minRtt "
+                            << m_minRtt.GetSeconds() << std::endl;
+                }*/
+
+                if (!m_firstSlowStart || m_nFlows == 1)
+                {
                     double sinceLastSlowStart = Simulator::Now().GetSeconds()
                             - m_lastSlowStart.GetSeconds();
                     if (sinceLastSlowStart > 2)
@@ -263,39 +347,52 @@ void TcpCR::NewAck(const SequenceNumber32& seq)
                             }
                         }
                         m_cWnd += static_cast<uint32_t>(m_power * adder);
-                        //std::cout<< Simulator::Now().GetSeconds() << " "<< m_dst_port <<  " Starv " << " m_cWnd: " << m_cWnd/1000 << " ssthresh: " << m_ssThresh/1000 << std::endl;
                     }
                 }
             }
-            else if (m_currentRTT  > 1.1 * m_minRtt.GetSeconds())
+            else if (m_currentRTT > 1.2 * m_minRtt.GetSeconds())
             {
-                //std::cout << Simulator::Now().GetSeconds() << " "<< m_dst_port <<": Cong state: m_currentRTT: " <<  m_currentRTT << " m_minRtt " << m_minRtt.GetSeconds() << std::endl;
-
                 // In congsetion state, two possibilities:
                 // (1) The estimate flow number is not right, reset ssthresh
                 // (2) The estimate flow number is fine, but send a little bit too aggressive, reduce cwnd gracefully
+                if ((Simulator::Now().GetSeconds() > 125) && (Simulator::Now().GetSeconds() < 138))
+                {
+                    std::cout << Simulator::Now().GetSeconds() << " " << m_dst_port
+                            << ": Full state: m_currentRTT: " << m_currentRTT << " m_minRtt "
+                            << m_minRtt.GetSeconds() << std::endl;
+                }
                 m_fastConverge = false;
-/*                double sinceLastSlowStart = Simulator::Now().GetSeconds()
-                                                - m_lastSlowStart.GetSeconds();*/
                 if (m_currentTp != 0)
                 {
                     // We need estimation of throughput to estimate fair share and flow number
                     double fixRatio = m_currentTp.Get() / (double) m_ebw;
                     uint32_t estimateFlows = EstimateFlowNumber(fixRatio);
                     double BDP = (double) m_ebw * m_minRtt.GetSeconds();
-                    if (estimateFlows != m_nFlows)
+                    // If every flow is as aggressive as me, then the total delay should not execeed ?
+                    // If some bad fish is not obey the game rule, the diff between current rtt and maximum rtt should be larger than
+                    // the maximin total delay
+                    if (estimateFlows > m_nFlows)
                     {
                         // The estimation of flow number is either too aggressive or too conservative
                         double sinceLastReduce = Simulator::Now().GetSeconds()
                                 - m_lastReduce.GetSeconds();
                         double sinceLastSlowStart = Simulator::Now().GetSeconds()
-                                                        - m_lastSlowStart.GetSeconds();
-                        //std::cout << Simulator::Now().GetSeconds() << " "<< m_dst_port <<": Cong state: m_firstSlowStart: " <<  m_firstSlowStart << " sinceLastSlowStart " << sinceLastSlowStart << std::endl;
+                                - m_lastSlowStart.GetSeconds();
                         // If it has been over 0.5s since last fast reduce
-                        if (!m_firstSlowStart || sinceLastSlowStart > 2)
+                        // Why this has not to be first slow start ?
+
+/*                        if ((m_dst_port == 3) &&(Simulator::Now().GetSeconds() > 45)
+                                && (Simulator::Now().GetSeconds() < 47))
+                        {
+                            std::cout << Simulator::Now().GetSeconds() << " " << m_dst_port
+                                    << ": Full state: m_lastSlowStart: " << m_lastSlowStart.GetSeconds()
+                                    << " sinceLastSlowStart " << sinceLastSlowStart << std::endl;
+                        }*/
+                        if (sinceLastSlowStart > 2)
                         {
                             if (m_lastReduce == 0 || sinceLastReduce > 1)
                             {
+                                // Reduce one flow at one time, maximum
                                 m_nFlows = estimateFlows;
                                 m_ssThresh = BDP / m_nFlows;
                                 m_cWnd = m_ssThresh;
@@ -308,12 +405,9 @@ void TcpCR::NewAck(const SequenceNumber32& seq)
                         m_cWnd -= adder;
                     }
                 }
-                //std::cout<< Simulator::Now().GetSeconds() << " "<< m_dst_port <<  " Cong " << " m_cWnd: " << m_cWnd/1000 << " ssthresh: " << m_ssThresh/1000 << std::endl;
             }
             else
             {
-                //std::cout << Simulator::Now().GetSeconds() << " "<< m_dst_port <<": Good state: m_currentRTT: " <<  m_currentRTT << " m_minRtt " << m_minRtt.GetSeconds() << std::endl;
-
                 // In good state. Reallocate fair share
                 if (m_currentTp != 0)
                 {
@@ -329,12 +423,50 @@ void TcpCR::NewAck(const SequenceNumber32& seq)
                 }
             }
         }
+        else if (m_stage == COMPETEING)
+        {
+            m_power = std::max(1, (int) m_nFlows - 1);
+            m_cWnd += static_cast<uint32_t>(m_nFlows * adder);
+            double fixRatio = m_currentTp.Get() / (double) m_ebw;
+            uint32_t estimateFlows = EstimateFlowNumber(fixRatio);
+            m_nFlows = estimateFlows;
+        }
+        // Do not do anything, collecting RTT samples
+        NS_LOG_FUNCTION(this);
+        if (m_startCollecting == 0)
+        {
+            m_startCollecting = Simulator::Now();
+        }
+        double timeDifference = Simulator::Now().GetSeconds() - m_startCollecting.GetSeconds();
+        // Save rtt samples, compute varience of RTT
+        if (timeDifference < 0.5)
+        {
+            m_time_samples.push_back(Simulator::Now().GetSeconds());  // in s
+            m_rtt_samples.push_back(m_currentRTT * 1000);  // in ms
+        }
         else
         {
-            m_fastConverge = false;
+            double slope = GetSlope();
+            m_time_samples.clear();
+            m_rtt_samples.clear();
+            m_startCollecting = Simulator::Now();
+            double standard = 1 / m_currentRTT;
+            double lowBound = standard / m_nFlows;
+            if (slope > lowBound)
+            {
+                m_comThresh += 1;
+                if (m_comThresh == 3)
+                {
+                    m_stage = COMPETEING;
+                }
+            }
+            else
+            {
+                m_comThresh = 0;
+                m_stage = STABLE;
+            }
         }
         EstimateTp();
-        GetTimeVarience();
         NS_LOG_INFO("In CongAvoid, updated to cwnd " << m_cWnd/1000 << " ssthresh " << m_ssThresh);
     }
     // Complete newAck processing
@@ -342,18 +474,30 @@ void TcpCR::NewAck(const SequenceNumber32& seq)
     *stream_var->GetStream() << Simulator::Now().GetSeconds() << " " << m_var << std::endl;
 }
 
-void TcpCR::GetTimeVarience()
+double TcpCR::GetSlope()
 {
-    NS_LOG_FUNCTION(this);
-    // Save rtt samples, compute varience of RTT
-    m_rtt_samples.push_back(m_currentRTT);
-    // Window to collect rtt samples: 200
-    if (m_rtt_samples.size() > 200)
+    long int npoints = m_time_samples.size(); //points
+    alglib::real_2d_array xy;
+    xy.setlength(npoints, npoints);
+    // Fill up the matrix. First column is x, second column is y
+    for (int x = 0; x < npoints; x++)
     {
-        m_rtt_samples.pop_front();
+        for (int x = 0; x < npoints; x++)
+        {
+            xy(x, 0) = m_time_samples[x];
+            xy(x, 1) = m_rtt_samples[x];
+        }
     }
-    m_var = GetVarience(m_rtt_samples);
+    long int nvars = 1;
+    long int info = 0;
+    alglib::linearmodel lm;
+    alglib::lrreport report;
+    alglib::lrbuild(xy, npoints, nvars, info, lm, report);
+    alglib::real_1d_array v;
+    lrunpack(lm, v, nvars);
+    return v[0];
 }
+
 
 void TcpCR::EstimateTp()
 {
@@ -363,7 +507,7 @@ void TcpCR::EstimateTp()
     if (m_ackSeqStartTime == 0)
         m_ackSeqStartTime = Simulator::Now().GetSeconds();
     double timeDifference = Simulator::Now().GetSeconds() - m_ackSeqStartTime;
-    if (timeDifference >= 0.5)
+    if (timeDifference >= 1.0)
     {
         // get a new m_currentTp samples
         m_currentTp = m_ackSeqCount * m_segmentSize / timeDifference; // in bps
@@ -452,34 +596,33 @@ void TcpCR::ReceivedAck(Ptr<Packet> packet, const TcpHeader& tcpHeader)
         m_src_port = tcpHeader.GetDestinationPort();
         m_dst_port = tcpHeader.GetSourcePort();
     }
-    std::string fileNameRoot = "./results/TcpCR/";
     AsciiTraceHelper ascii;
     if (!stream_tp)
     {
         AsciiTraceHelper ascii;
         stream_tp = ascii.CreateFileStream(
-                fileNameRoot + NumberToString(m_src_port) + "-" + NumberToString(m_dst_port)
+                folder + NumberToString(m_src_port) + "-" + NumberToString(m_dst_port)
                         + ".throughput");
     }
     if (!stream_rtt)
     {
         AsciiTraceHelper ascii;
         stream_rtt = ascii.CreateFileStream(
-                fileNameRoot + NumberToString(m_src_port) + "-" + NumberToString(m_dst_port)
+                folder + NumberToString(m_src_port) + "-" + NumberToString(m_dst_port)
                         + ".rtt");
     }
     if (!stream_var)
     {
         AsciiTraceHelper ascii;
         stream_var = ascii.CreateFileStream(
-                fileNameRoot + NumberToString(m_src_port) + "-" + NumberToString(m_dst_port)
+                folder + NumberToString(m_src_port) + "-" + NumberToString(m_dst_port)
                         + ".var");
     }
     if (!stream_other)
     {
         AsciiTraceHelper ascii;
         stream_other = ascii.CreateFileStream(
-                fileNameRoot + NumberToString(m_src_port) + "-" + NumberToString(m_dst_port)
+                folder + NumberToString(m_src_port) + "-" + NumberToString(m_dst_port)
                         + ".other");
     }
     if ((0 != (tcpHeader.GetFlags() & TcpHeader::ACK)))
@@ -592,7 +735,10 @@ void TcpCR::Reset(void)
     m_fastConverge = false;
     m_power = 0;
     m_lastSlowStart = Time(0);
+    m_startCollecting = Time(0);
     m_firstSlowStart = false;
+    m_stage = STABLE;
+    m_comThresh = 0;
 }
 
 /* Retransmit timeout */
