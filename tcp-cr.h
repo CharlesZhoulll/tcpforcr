@@ -84,6 +84,8 @@ protected:
   virtual void DupAck (const TcpHeader& t, uint32_t count);  // Halving cwnd and reset nextTxSequence
   virtual void Retransmit (void); // Exit fast recovery upon retransmit timeout
   virtual void ReceivedAck (Ptr<Packet> packet, const TcpHeader& tcpHeader); // Process received ACK
+  void GetFlowNumber (void);
+  void EstimateRttTrend (void);
   //virtual void EstimateBW (int acked, const TcpHeader& tcpHeader, Time rtt); // Process received ACK
   double GetAverage (const std::list<double>);
   double GetVarience (const std::list<double>);
@@ -141,10 +143,11 @@ protected:
   //uint32_t               m_lastState;
   //int                    m_starveCount;
   bool                   m_fastConverge;
-  uint32_t               m_power;
+  uint32_t               m_increaseRate;
 
   uint32_t                   m_stage;
-  uint32_t                   m_comThresh;
+  uint32_t                   m_increaseCount;
+  uint32_t                   m_increaseThresh;
 
   // Judging whether stable or not
   double                 m_sigma;
